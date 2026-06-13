@@ -151,6 +151,8 @@ class BatchTask(Base):
     success_count = Column(Integer, default=0)
     failed_count = Column(Integer, default=0)
     
+    invoice_ids = Column(JSON, default=list)
+    
     created_by = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)

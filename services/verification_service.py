@@ -15,6 +15,7 @@ class BatchTaskService:
             task_id=task_id,
             task_name=task_data.task_name,
             total_count=len(task_data.invoice_ids),
+            invoice_ids=task_data.invoice_ids,
             created_by=user_id,
             status="pending"
         )

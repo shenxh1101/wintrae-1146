@@ -89,13 +89,21 @@ async def upload_invoice(
         reimbursement_id=reimbursement_id
     )
     
-    invoice = InvoiceService.create_invoice(
+    invoice, duplicate_result = InvoiceService.create_invoice(
         db=db,
         invoice_data=invoice_data,
         submitter_id=current_user.id,
         file_path=file_path,
         file_type=file_ext
     )
+    
+    if invoice is None and duplicate_result is not None:
+        return {
+            "success": False,
+            "is_duplicate": True,
+            "message": "发票重复提交",
+            "duplicate_info": duplicate_result.model_dump()
+        }
     
     VerificationRecordService.create_verification_record(
         db=db,
@@ -111,41 +119,61 @@ async def upload_invoice(
     return invoice
 
 
-@router.post("/recognize", response_model=dict)
+@router.post("/recognize")
 async def recognize_invoice(
+    request: Request,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     file_ext = file.filename.split(".")[-1].lower()
     if file_ext not in settings.ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="不支持的文件类型"
+        return {
+            "success": False,
+            "error": "不支持的文件类型",
+            "error_code": "UNSUPPORTED_FILE_TYPE",
+            "supported_types": settings.ALLOWED_EXTENSIONS
+        }
+    
+    try:
+        content = await file.read()
+        
+        if len(content) == 0:
+            return {
+                "success": False,
+                "error": "文件内容为空",
+                "error_code": "EMPTY_FILE"
+            }
+        
+        filename = file.filename.lower()
+        
+        recognized_data = InvoiceService.recognize_invoice_content(
+            content=content,
+            filename=filename,
+            file_type=file_ext
         )
-    
-    content = await file.read()
-    
-    mock_recognized_data = {
-        "invoice_code": "144031900110",
-        "invoice_number": "12345678",
-        "invoice_type": "vat_special",
-        "buyer_name": "示例购买方",
-        "buyer_tax_number": "91440300MA5DXXXXX",
-        "seller_name": "示例销售方",
-        "seller_tax_number": "91440300MA5DYYYYY",
-        "total_amount": 1130.00,
-        "tax_amount": 130.00,
-        "amount_without_tax": 1000.00,
-        "invoice_date": "2024-01-15",
-        "confidence": 0.95
-    }
-    
-    return {
-        "success": True,
-        "data": mock_recognized_data,
-        "message": "识别成功（模拟数据）"
-    }
+        
+        if recognized_data["success"]:
+            return {
+                "success": True,
+                "data": recognized_data["data"],
+                "confidence": recognized_data.get("confidence", 0.0),
+                "warnings": recognized_data.get("warnings", [])
+            }
+        else:
+            return {
+                "success": False,
+                "error": recognized_data.get("error", "识别失败"),
+                "error_code": recognized_data.get("error_code", "RECOGNITION_FAILED"),
+                "details": recognized_data.get("details")
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"识别过程发生错误: {str(e)}",
+            "error_code": "RECOGNITION_ERROR"
+        }
 
 
 @router.post("/verify/{invoice_id}", response_model=VerificationResult)

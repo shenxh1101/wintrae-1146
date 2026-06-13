@@ -43,7 +43,6 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6)
-    role: UserRole = UserRole.EMPLOYEE
 
 
 class UserUpdate(BaseModel):
@@ -142,6 +141,7 @@ class DuplicateCheckResult(BaseModel):
     original_invoice_id: Optional[int] = None
     original_submission_date: Optional[datetime] = None
     submission_count: int = 0
+    original_invoice: Optional[dict] = None
 
 
 class TitleValidationRequest(BaseModel):
@@ -244,3 +244,20 @@ class Token(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class VerificationRecordResponse(BaseModel):
+    id: int
+    invoice_id: int
+    action: str
+    status: str
+    result: Optional[str] = None
+    error_message: Optional[str] = None
+    request_data: Optional[dict] = None
+    response_data: Optional[dict] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True

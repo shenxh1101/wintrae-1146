@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from database import get_db
-from models import User
+from models import User, UserRole
 from schemas import UserCreate, UserResponse, UserUpdate, Token
 from auth import verify_password, get_password_hash, create_access_token, get_current_user
 from config import settings
@@ -31,7 +31,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         email=user.email,
         full_name=user.full_name,
         hashed_password=hashed_password,
-        role=user.role
+        role=UserRole.EMPLOYEE
     )
     
     db.add(db_user)
