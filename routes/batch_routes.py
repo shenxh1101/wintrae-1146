@@ -8,12 +8,13 @@ from models import User, UserRole, BatchTask
 from schemas import BatchTaskCreate, BatchTaskResponse, VerificationRequest
 from services.verification_service import BatchTaskService, VerificationRecordService
 from services.invoice_service import InvoiceService
+from services.receipt_service import ReceiptService
 from auth import get_current_user, require_roles
 
 router = APIRouter(prefix="/batch", tags=["批量任务"])
 
 
-@router.post("/tasks", response_model=BatchTaskResponse)
+@router.post("/tasks")
 async def create_batch_task(
     task_data: BatchTaskCreate,
     current_user: User = Depends(get_current_user),
@@ -26,7 +27,25 @@ async def create_batch_task(
         )
     
     task = BatchTaskService.create_batch_task(db, task_data, current_user.id)
-    return task
+    
+    receipt = ReceiptService.create_receipt(
+        db=db,
+        source_type="batch",
+        source_id=",".join(str(id) for id in task_data.invoice_ids),
+        user_id=current_user.id,
+        invoice_count=len(task_data.invoice_ids)
+    )
+    
+    return {
+        "success": True,
+        "task_id": task.task_id,
+        "receipt_id": receipt.receipt_id,
+        "task_name": task.task_name,
+        "total_count": task.total_count,
+        "status": task.status,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "message": "批量任务创建成功，可调用 /batch/tasks/{task_id}/process 执行处理"
+    }
 
 
 @router.post("/tasks/{task_id}/process")
@@ -54,15 +73,21 @@ async def process_batch_task(
             detail="任务已完成，不能重复处理"
         )
     
+    receipts = db.query(Receipt).filter(
+        Receipt.source_id == ",".join(str(id) for id in (task.invoice_ids or []))
+    ).all()
+    receipt = receipts[0] if receipts else None
+    
     task = BatchTaskService.process_batch_task(db, task_id)
     
     invoice_ids = task.invoice_ids or []
     success_count = 0
     failed_count = 0
+    duplicate_count = 0
     processed_count = 0
     results = []
     
-    from models import Invoice
+    from models import Invoice, VerificationStatus
     for invoice_id in invoice_ids:
         processed_count += 1
         
@@ -76,6 +101,16 @@ async def process_batch_task(
                     "status": "failed",
                     "message": "发票不存在"
                 })
+                
+                if receipt:
+                    ReceiptService.update_receipt_progress(
+                        db=db,
+                        receipt_id=receipt.receipt_id,
+                        processed_count=processed_count,
+                        success_count=success_count,
+                        failed_count=failed_count,
+                        duplicate_count=duplicate_count
+                    )
                 continue
             
             verification_request = VerificationRequest(
@@ -99,7 +134,14 @@ async def process_batch_task(
                 response_data=result.model_dump()
             )
             
-            if result.is_valid:
+            if result.status == VerificationStatus.DUPLICATE:
+                duplicate_count += 1
+                results.append({
+                    "invoice_id": invoice_id,
+                    "status": "duplicate",
+                    "message": result.message
+                })
+            elif result.is_valid:
                 success_count += 1
                 results.append({
                     "invoice_id": invoice_id,
@@ -123,6 +165,16 @@ async def process_batch_task(
                 "message": str(e)
             })
         
+        if receipt:
+            ReceiptService.update_receipt_progress(
+                db=db,
+                receipt_id=receipt.receipt_id,
+                processed_count=processed_count,
+                success_count=success_count,
+                failed_count=failed_count,
+                duplicate_count=duplicate_count
+            )
+        
         task.processed_count = processed_count
         task.success_count = success_count
         task.failed_count = failed_count
@@ -133,14 +185,31 @@ async def process_batch_task(
     db.commit()
     db.refresh(task)
     
+    if receipt:
+        final_status = "completed" if failed_count == 0 else "warning"
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt.receipt_id,
+            final_status=final_status,
+            final_message=f"批量处理完成：成功{success_count}张，失败{failed_count}张，重复{duplicate_count}张",
+            final_result={
+                "success_count": success_count,
+                "failed_count": failed_count,
+                "duplicate_count": duplicate_count,
+                "results": results
+            }
+        )
+    
     return {
         "success": True,
         "task_id": task_id,
+        "receipt_id": receipt.receipt_id if receipt else None,
         "status": task.status,
         "total_count": task.total_count,
         "processed_count": processed_count,
         "success_count": success_count,
         "failed_count": failed_count,
+        "duplicate_count": duplicate_count,
         "results": results
     }
 

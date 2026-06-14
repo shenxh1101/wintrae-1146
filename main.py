@@ -5,7 +5,7 @@ import os
 
 from config import settings
 from database import engine, Base
-from routes import auth_routes, invoice_routes, batch_routes, record_routes, admin_routes
+from routes import auth_routes, invoice_routes, batch_routes, record_routes, admin_routes, receipt_routes
 
 
 @asynccontextmanager
@@ -38,6 +38,7 @@ app.include_router(invoice_routes.router, prefix=settings.API_V1_PREFIX)
 app.include_router(batch_routes.router, prefix=settings.API_V1_PREFIX)
 app.include_router(record_routes.router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_routes.router, prefix=settings.API_V1_PREFIX)
+app.include_router(receipt_routes.router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/")

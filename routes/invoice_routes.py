@@ -44,32 +44,66 @@ async def upload_invoice(
 ):
     action_records = []
     
+    from services.receipt_service import ReceiptService
+    receipt = ReceiptService.create_receipt(
+        db=db,
+        source_type="single",
+        source_id="0",
+        user_id=current_user.id,
+        invoice_count=1
+    )
+    receipt_id = receipt.receipt_id
+    
     if file.size > settings.MAX_FILE_SIZE:
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt_id,
+            final_status="failed",
+            final_message=f"文件大小超过限制 ({settings.MAX_FILE_SIZE // (1024*1024)}MB)",
+            final_result={"error_code": "FILE_TOO_LARGE"}
+        )
         return {
             "success": False,
             "is_duplicate": False,
             "is_new": False,
             "error_code": "FILE_TOO_LARGE",
+            "receipt_id": receipt_id,
             "message": f"文件大小超过限制 ({settings.MAX_FILE_SIZE // (1024*1024)}MB)"
         }
     
     file_ext = file.filename.split(".")[-1].lower()
     if file_ext not in settings.ALLOWED_EXTENSIONS:
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt_id,
+            final_status="failed",
+            final_message=f"不支持的文件类型，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}",
+            final_result={"error_code": "UNSUPPORTED_FILE_TYPE"}
+        )
         return {
             "success": False,
             "is_duplicate": False,
             "is_new": False,
             "error_code": "UNSUPPORTED_FILE_TYPE",
+            "receipt_id": receipt_id,
             "message": f"不支持的文件类型，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         }
     
     content = await file.read()
     if len(content) == 0:
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt_id,
+            final_status="failed",
+            final_message="文件内容为空",
+            final_result={"error_code": "EMPTY_FILE"}
+        )
         return {
             "success": False,
             "is_duplicate": False,
             "is_new": False,
             "error_code": "EMPTY_FILE",
+            "receipt_id": receipt_id,
             "message": "文件内容为空"
         }
     
@@ -104,11 +138,22 @@ async def upload_invoice(
         )
         
         if not recognized_data.get("success"):
+            ReceiptService.complete_receipt(
+                db=db,
+                receipt_id=receipt_id,
+                final_status="failed",
+                final_message=recognized_data.get("error", "无法从文件中识别发票信息"),
+                final_result={
+                    "error_code": recognized_data.get("error_code", "RECOGNITION_FAILED"),
+                    "details": recognized_data.get("details")
+                }
+            )
             return {
                 "success": False,
                 "is_duplicate": False,
                 "is_new": False,
                 "error_code": recognized_data.get("error_code", "RECOGNITION_FAILED"),
+                "receipt_id": receipt_id,
                 "message": recognized_data.get("error", "无法从文件中识别发票信息"),
                 "details": recognized_data.get("details"),
                 "original_data": original_data
@@ -137,18 +182,27 @@ async def upload_invoice(
                 pass
     
     if not invoice_code or not invoice_number or not total_amount:
+        missing = [
+            f for f in ["invoice_code", "invoice_number", "total_amount"]
+            if f == "invoice_code" and not invoice_code or
+               f == "invoice_number" and not invoice_number or
+               f == "total_amount" and not total_amount
+        ]
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt_id,
+            final_status="failed",
+            final_message="缺少关键字段（发票代码、号码或金额）",
+            final_result={"error_code": "MISSING_KEY_FIELDS", "missing_fields": missing}
+        )
         return {
             "success": False,
             "is_duplicate": False,
             "is_new": False,
             "error_code": "MISSING_KEY_FIELDS",
+            "receipt_id": receipt_id,
             "message": "缺少关键字段（发票代码、号码或金额）",
-            "missing_fields": [
-                f for f in ["invoice_code", "invoice_number", "total_amount"]
-                if f == "invoice_code" and not invoice_code or
-                   f == "invoice_number" and not invoice_number or
-                   f == "total_amount" and not total_amount
-            ],
+            "missing_fields": missing,
             "original_data": original_data
         }
     
@@ -159,19 +213,31 @@ async def upload_invoice(
         is_owner = original_invoice and original_invoice.submitter_id == current_user.id
         
         if not is_owner and current_user.role == UserRole.EMPLOYEE:
-            return {
-                "success": False,
-                "is_duplicate": True,
-                "is_new": False,
-                "error_code": "DUPLICATE_INVOICE_OTHERS",
-                "message": "该发票已被他人提交，无法重复上传"
-            }
+            ReceiptService.complete_receipt(
+                db=db,
+                receipt_id=receipt_id,
+                final_status="rejected",
+                final_message="无权上传：他人已提交的发票",
+                final_result={"error_code": "UNAUTHORIZED"}
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权上传他人已提交的发票"
+            )
         
+        ReceiptService.complete_receipt(
+            db=db,
+            receipt_id=receipt_id,
+            final_status="duplicate",
+            final_message="该发票您已提交过，无需重复上传",
+            final_result={"original_invoice_id": duplicate_result.original_invoice_id}
+        )
         return {
             "success": False,
             "is_duplicate": True,
             "is_new": False,
             "error_code": "DUPLICATE_INVOICE",
+            "receipt_id": receipt_id,
             "message": "该发票您已提交过，无需重复上传",
             "is_owner": True,
             "original_invoice_id": duplicate_result.original_invoice_id,
@@ -221,6 +287,9 @@ async def upload_invoice(
     db.add(invoice)
     db.commit()
     db.refresh(invoice)
+    
+    receipt.source_id = str(invoice.id)
+    db.commit()
     
     upload_record = VerificationRecordService.create_verification_record(
         db=db,
@@ -307,11 +376,23 @@ async def upload_invoice(
         "created_at": invoice.created_at.isoformat() if invoice.created_at else None
     }
     
+    final_status = "success" if verification_result_dict and verification_result_dict.get("is_valid") else "warning"
+    final_message = verification_result_dict.get("message", "发票上传并查验完成") if verification_result_dict else "发票上传完成"
+    
+    ReceiptService.complete_receipt(
+        db=db,
+        receipt_id=receipt_id,
+        final_status=final_status,
+        final_message=final_message,
+        final_result=verification_result_dict
+    )
+    
     return {
         "success": True,
         "is_duplicate": False,
         "is_new": True,
         "error_code": None,
+        "receipt_id": receipt_id,
         "message": "发票上传并查验成功",
         "invoice": invoice_dict,
         "verification_result": verification_result_dict,
@@ -726,6 +807,179 @@ async def export_invoices(
         ExportService.export_to_word(db, invoices, output_path)
     elif export_request.format == "pdf":
         output_path = os.path.join(export_dir, f"invoices_export_{timestamp}.pdf")
+        ExportService.export_to_pdf(db, invoices, output_path)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持的导出格式"
+        )
+    
+    return FileResponse(
+        path=output_path,
+        filename=os.path.basename(output_path),
+        media_type="application/octet-stream"
+    )
+
+
+@router.get("/reimbursement/{reimbursement_id}")
+async def get_reimbursement_invoices(
+    reimbursement_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    invoices = db.query(Invoice).filter(
+        Invoice.reimbursement_id == reimbursement_id
+    ).order_by(Invoice.created_at.desc()).all()
+    
+    if not invoices:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到该报销单下的发票"
+        )
+    
+    if current_user.role == UserRole.EMPLOYEE:
+        own_invoices = [inv for inv in invoices if inv.submitter_id == current_user.id]
+        if not own_invoices:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权访问该报销单"
+            )
+        invoices = own_invoices
+    
+    items = []
+    for invoice in invoices:
+        records = db.query(VerificationRecord).filter(
+            VerificationRecord.invoice_id == invoice.id
+        ).order_by(VerificationRecord.created_at.asc()).all()
+        
+        items.append({
+            "invoice_id": invoice.id,
+            "invoice_code": invoice.invoice_code,
+            "invoice_number": invoice.invoice_number,
+            "invoice_type": invoice.invoice_type.value if invoice.invoice_type else None,
+            "seller_name": invoice.seller_name,
+            "buyer_name": invoice.buyer_name,
+            "total_amount": invoice.total_amount,
+            "tax_amount": invoice.tax_amount,
+            "invoice_date": invoice.invoice_date.isoformat() if invoice.invoice_date else None,
+            "verification_status": invoice.verification_status.value if invoice.verification_status else None,
+            "review_status": invoice.review_status.value if invoice.review_status else None,
+            "expense_category": invoice.expense_category,
+            "is_blacklisted": invoice.is_blacklisted,
+            "exception_reason": invoice.exception_reason,
+            "submitter_id": invoice.submitter_id,
+            "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+            "action_records": [{
+                "action": r.action,
+                "status": r.status,
+                "message": r.result,
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            } for r in records]
+        })
+    
+    total_amount = sum(item["total_amount"] or 0 for item in items)
+    total_tax = sum(item["tax_amount"] or 0 for item in items)
+    
+    return {
+        "reimbursement_id": reimbursement_id,
+        "total_count": len(items),
+        "total_amount": total_amount,
+        "total_tax": total_tax,
+        "invoices": items
+    }
+
+
+@router.get("/reimbursement/{reimbursement_id}/track")
+async def get_reimbursement_track(
+    reimbursement_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    invoices = db.query(Invoice).filter(
+        Invoice.reimbursement_id == reimbursement_id
+    ).all()
+    
+    if not invoices:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到该报销单下的发票"
+        )
+    
+    if current_user.role == UserRole.EMPLOYEE:
+        own_invoices = [inv for inv in invoices if inv.submitter_id == current_user.id]
+        if not own_invoices:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权访问该报销单"
+            )
+        invoices = own_invoices
+    
+    track = []
+    for invoice in invoices:
+        records = db.query(VerificationRecord).filter(
+            VerificationRecord.invoice_id == invoice.id
+        ).order_by(VerificationRecord.created_at.asc()).all()
+        
+        for record in records:
+            track.append({
+                "invoice_id": invoice.id,
+                "invoice_number": invoice.invoice_number,
+                "seller_name": invoice.seller_name,
+                "action": record.action,
+                "status": record.status,
+                "message": record.result,
+                "timestamp": record.created_at.isoformat() if record.created_at else None
+            })
+    
+    track.sort(key=lambda x: x["timestamp"] or "", reverse=True)
+    
+    return {
+        "reimbursement_id": reimbursement_id,
+        "total_count": len(invoices),
+        "track": track
+    }
+
+
+@router.post("/reimbursement/{reimbursement_id}/export")
+async def export_reimbursement(
+    reimbursement_id: str,
+    format: str = "excel",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    invoices = db.query(Invoice).filter(
+        Invoice.reimbursement_id == reimbursement_id
+    ).all()
+    
+    if not invoices:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到该报销单下的发票"
+        )
+    
+    if current_user.role == UserRole.EMPLOYEE:
+        own_invoices = [inv for inv in invoices if inv.submitter_id == current_user.id]
+        if not own_invoices:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权访问该报销单"
+            )
+        invoices = own_invoices
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_dir = os.path.join(settings.UPLOAD_DIR, "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    
+    filename = f"reimbursement_{reimbursement_id}_{timestamp}"
+    
+    if format == "excel":
+        output_path = os.path.join(export_dir, f"{filename}.xlsx")
+        ExportService.export_to_excel(db, invoices, output_path)
+    elif format == "word":
+        output_path = os.path.join(export_dir, f"{filename}.docx")
+        ExportService.export_to_word(db, invoices, output_path)
+    elif format == "pdf":
+        output_path = os.path.join(export_dir, f"{filename}.pdf")
         ExportService.export_to_pdf(db, invoices, output_path)
     else:
         raise HTTPException(

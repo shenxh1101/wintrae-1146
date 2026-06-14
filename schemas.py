@@ -275,3 +275,33 @@ class InvoiceUploadResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+
+class ReceiptResponse(BaseModel):
+    receipt_id: str
+    source_type: str
+    source_id: Optional[str] = None
+    status: str
+    progress: dict
+    final_status: Optional[str] = None
+    final_message: Optional[str] = None
+    final_result: Optional[dict] = None
+    items: Optional[List[dict]] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class NotificationMessage(BaseModel):
+    receipt_id: str
+    event_type: str
+    status: str
+    message: str
+    invoice_id: Optional[int] = None
+    invoice_info: Optional[dict] = None
+    action_records: Optional[List[dict]] = None
+    timestamp: datetime
+    
+    class Config:
+        from_attributes = True

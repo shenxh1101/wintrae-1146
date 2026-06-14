@@ -159,3 +159,31 @@ class BatchTask(Base):
     
     result_file_path = Column(String(500))
     error_log = Column(Text)
+
+
+class Receipt(Base):
+    __tablename__ = "receipts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    receipt_id = Column(String(50), unique=True, index=True, nullable=False)
+    
+    source_type = Column(String(20))
+    source_id = Column(String(50))
+    
+    status = Column(String(20), default="processing")
+    
+    invoice_count = Column(Integer, default=0)
+    processed_count = Column(Integer, default=0)
+    success_count = Column(Integer, default=0)
+    failed_count = Column(Integer, default=0)
+    duplicate_count = Column(Integer, default=0)
+    
+    user_id = Column(Integer, ForeignKey("users.id"))
+    
+    final_status = Column(String(20))
+    final_message = Column(Text)
+    final_result = Column(JSON)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime)
