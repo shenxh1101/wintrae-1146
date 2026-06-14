@@ -261,3 +261,17 @@ class VerificationRecordResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+
+class InvoiceUploadResponse(BaseModel):
+    success: bool
+    is_duplicate: bool = False
+    is_new: bool = True
+    invoice: Optional[dict] = None
+    duplicate_info: Optional[dict] = None
+    verification_result: Optional[dict] = None
+    action_records: Optional[List[dict]] = None
+    message: str = ""
+    
+    class Config:
+        from_attributes = True

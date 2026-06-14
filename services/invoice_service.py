@@ -36,18 +36,6 @@ class InvoiceService:
         db.commit()
         db.refresh(invoice)
         
-        verification_result = InvoiceService.verify_invoice(
-            db, 
-            invoice.id, 
-            VerificationRequest(
-                invoice_code=invoice.invoice_code,
-                invoice_number=invoice.invoice_number,
-                invoice_date=invoice.invoice_date.strftime("%Y-%m-%d") if invoice.invoice_date else None,
-                total_amount=invoice.total_amount,
-                tax_number=invoice.seller_tax_number
-            )
-        )
-        
         return invoice, None
 
     @staticmethod
