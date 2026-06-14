@@ -42,13 +42,15 @@ async def upload_invoice(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    action_records = []
+    
     if file.size > settings.MAX_FILE_SIZE:
         return {
             "success": False,
             "is_duplicate": False,
             "is_new": False,
-            "message": f"文件大小超过限制 ({settings.MAX_FILE_SIZE // (1024*1024)}MB)",
-            "error_code": "FILE_TOO_LARGE"
+            "error_code": "FILE_TOO_LARGE",
+            "message": f"文件大小超过限制 ({settings.MAX_FILE_SIZE // (1024*1024)}MB)"
         }
     
     file_ext = file.filename.split(".")[-1].lower()
@@ -57,19 +59,30 @@ async def upload_invoice(
             "success": False,
             "is_duplicate": False,
             "is_new": False,
-            "message": f"不支持的文件类型，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}",
-            "error_code": "UNSUPPORTED_FILE_TYPE"
+            "error_code": "UNSUPPORTED_FILE_TYPE",
+            "message": f"不支持的文件类型，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         }
     
-    upload_dir = settings.UPLOAD_DIR
-    os.makedirs(upload_dir, exist_ok=True)
-    
-    file_id = str(uuid.uuid4())
-    file_path = os.path.join(upload_dir, f"{file_id}.{file_ext}")
-    
     content = await file.read()
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        await out_file.write(content)
+    if len(content) == 0:
+        return {
+            "success": False,
+            "is_duplicate": False,
+            "is_new": False,
+            "error_code": "EMPTY_FILE",
+            "message": "文件内容为空"
+        }
+    
+    original_data = {
+        "invoice_code": invoice_code,
+        "invoice_number": invoice_number,
+        "invoice_type": invoice_type,
+        "total_amount": total_amount,
+        "tax_amount": tax_amount,
+        "buyer_name": buyer_name,
+        "seller_name": seller_name,
+        "invoice_date": invoice_date
+    }
     
     parsed_date = None
     if invoice_date:
@@ -80,6 +93,107 @@ async def upload_invoice(
                 parsed_date = datetime.strptime(invoice_date, "%Y-%m-%d")
             except:
                 pass
+    
+    has_key_fields = bool(invoice_code and invoice_number and total_amount)
+    
+    if not has_key_fields:
+        recognized_data = InvoiceService.recognize_invoice_content(
+            content=content,
+            filename=file.filename.lower(),
+            file_type=file_ext
+        )
+        
+        if not recognized_data.get("success"):
+            return {
+                "success": False,
+                "is_duplicate": False,
+                "is_new": False,
+                "error_code": recognized_data.get("error_code", "RECOGNITION_FAILED"),
+                "message": recognized_data.get("error", "无法从文件中识别发票信息"),
+                "details": recognized_data.get("details"),
+                "original_data": original_data
+            }
+        
+        invoice_code = invoice_code or recognized_data.get("data", {}).get("invoice_code")
+        invoice_number = invoice_number or recognized_data.get("data", {}).get("invoice_number")
+        total_amount = total_amount or recognized_data.get("data", {}).get("total_amount")
+        tax_amount = tax_amount or recognized_data.get("data", {}).get("tax_amount")
+        buyer_name = buyer_name or recognized_data.get("data", {}).get("buyer_name")
+        seller_name = seller_name or recognized_data.get("data", {}).get("seller_name")
+        invoice_type = recognized_data.get("data", {}).get("invoice_type", invoice_type)
+        
+        if invoice_code and invoice_date:
+            try:
+                parsed_date = datetime.fromisoformat(invoice_date.replace("/", "-"))
+            except:
+                try:
+                    parsed_date = datetime.strptime(invoice_date, "%Y-%m-%d")
+                except:
+                    pass
+        elif recognized_data.get("data", {}).get("invoice_date"):
+            try:
+                parsed_date = datetime.strptime(recognized_data["data"]["invoice_date"], "%Y-%m-%d")
+            except:
+                pass
+    
+    if not invoice_code or not invoice_number or not total_amount:
+        return {
+            "success": False,
+            "is_duplicate": False,
+            "is_new": False,
+            "error_code": "MISSING_KEY_FIELDS",
+            "message": "缺少关键字段（发票代码、号码或金额）",
+            "missing_fields": [
+                f for f in ["invoice_code", "invoice_number", "total_amount"]
+                if f == "invoice_code" and not invoice_code or
+                   f == "invoice_number" and not invoice_number or
+                   f == "total_amount" and not total_amount
+            ],
+            "original_data": original_data
+        }
+    
+    duplicate_result = InvoiceService.check_duplicate(db, invoice_code, invoice_number, total_amount)
+    
+    if duplicate_result.is_duplicate:
+        original_invoice = db.query(Invoice).filter(Invoice.id == duplicate_result.original_invoice_id).first()
+        is_owner = original_invoice and original_invoice.submitter_id == current_user.id
+        
+        if not is_owner and current_user.role == UserRole.EMPLOYEE:
+            return {
+                "success": False,
+                "is_duplicate": True,
+                "is_new": False,
+                "error_code": "DUPLICATE_INVOICE_OTHERS",
+                "message": "该发票已被他人提交，无法重复上传"
+            }
+        
+        return {
+            "success": False,
+            "is_duplicate": True,
+            "is_new": False,
+            "error_code": "DUPLICATE_INVOICE",
+            "message": "该发票您已提交过，无需重复上传",
+            "is_owner": True,
+            "original_invoice_id": duplicate_result.original_invoice_id,
+            "original_invoice": {
+                "id": original_invoice.id,
+                "invoice_code": original_invoice.invoice_code,
+                "invoice_number": original_invoice.invoice_number,
+                "seller_name": original_invoice.seller_name,
+                "total_amount": original_invoice.total_amount,
+                "verification_status": original_invoice.verification_status.value if original_invoice.verification_status else None,
+                "created_at": original_invoice.created_at.isoformat() if original_invoice.created_at else None
+            } if is_owner or current_user.role in [UserRole.ADMIN, UserRole.FINANCE, UserRole.AUDITOR] else None
+        }
+    
+    upload_dir = settings.UPLOAD_DIR
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(upload_dir, f"{file_id}.{file_ext}")
+    
+    async with aiofiles.open(file_path, 'wb') as out_file:
+        await out_file.write(content)
     
     invoice_data = InvoiceCreate(
         invoice_code=invoice_code,
@@ -95,92 +209,82 @@ async def upload_invoice(
         reimbursement_id=reimbursement_id
     )
     
-    invoice, duplicate_result = InvoiceService.create_invoice(
-        db=db,
-        invoice_data=invoice_data,
+    invoice = Invoice(
         submitter_id=current_user.id,
         file_path=file_path,
-        file_type=file_ext
+        file_type=file_ext,
+        verification_status=VerificationStatus.PENDING,
+        review_status=ReviewStatus.PENDING_REVIEW,
+        **invoice_data.model_dump()
     )
     
-    action_records = []
+    db.add(invoice)
+    db.commit()
+    db.refresh(invoice)
     
     upload_record = VerificationRecordService.create_verification_record(
         db=db,
-        invoice_id=invoice.id if invoice else 0,
+        invoice_id=invoice.id,
         user_id=current_user.id,
         action="upload",
         status="success",
         result="发票上传成功",
-        request_data={"file_type": file_ext, "file_size": len(content)},
+        request_data={"file_type": file_ext, "file_size": len(content), "fields_provided": {
+            "invoice_code": bool(invoice_code),
+            "invoice_number": bool(invoice_number),
+            "total_amount": bool(total_amount),
+            "tax_amount": bool(tax_amount)
+        }},
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent")
     )
     
-    if upload_record:
-        action_records.append({
-            "id": upload_record.id,
-            "action": "upload",
-            "status": "success",
-            "message": "发票上传成功",
-            "created_at": upload_record.created_at.isoformat() if upload_record.created_at else None
-        })
+    action_records.append({
+        "id": upload_record.id,
+        "action": "upload",
+        "status": "success",
+        "message": "发票上传成功",
+        "created_at": upload_record.created_at.isoformat() if upload_record.created_at else None
+    })
     
-    if invoice:
-        verification_request = VerificationRequest(
-            invoice_code=invoice.invoice_code,
-            invoice_number=invoice.invoice_number,
-            invoice_date=invoice.invoice_date.strftime("%Y-%m-%d") if invoice.invoice_date else None,
-            total_amount=invoice.total_amount,
-            tax_number=invoice.seller_tax_number
+    verification_request = VerificationRequest(
+        invoice_code=invoice.invoice_code,
+        invoice_number=invoice.invoice_number,
+        invoice_date=invoice.invoice_date.strftime("%Y-%m-%d") if invoice.invoice_date else None,
+        total_amount=invoice.total_amount,
+        tax_number=invoice.seller_tax_number
+    )
+    
+    try:
+        verification_result = InvoiceService.verify_invoice(db, invoice.id, verification_request)
+        
+        verify_record = VerificationRecordService.create_verification_record(
+            db=db,
+            invoice_id=invoice.id,
+            user_id=current_user.id,
+            action="verify",
+            status=verification_result.status.value,
+            result=verification_result.message,
+            request_data=verification_request.model_dump(),
+            response_data=verification_result.model_dump()
         )
         
-        try:
-            verification_result = InvoiceService.verify_invoice(db, invoice.id, verification_request)
-            
-            verify_record = VerificationRecordService.create_verification_record(
-                db=db,
-                invoice_id=invoice.id,
-                user_id=current_user.id,
-                action="verify",
-                status=verification_result.status.value,
-                result=verification_result.message,
-                request_data=verification_request.model_dump(),
-                response_data=verification_result.model_dump()
-            )
-            
-            if verify_record:
-                action_records.append({
-                    "id": verify_record.id,
-                    "action": "verify",
-                    "status": verification_result.status.value,
-                    "message": verification_result.message,
-                    "is_valid": verification_result.is_valid,
-                    "exception_reason": verification_result.exception_reason,
-                    "merchant_blacklisted": verification_result.merchant_blacklisted,
-                    "created_at": verify_record.created_at.isoformat() if verify_record.created_at else None
-                })
-            
-            verification_result_dict = verification_result.model_dump()
-        except Exception as e:
-            verification_result_dict = {"error": str(e)}
-    else:
-        verification_result_dict = None
+        action_records.append({
+            "id": verify_record.id,
+            "action": "verify",
+            "status": verification_result.status.value,
+            "message": verification_result.message,
+            "is_valid": verification_result.is_valid,
+            "exception_reason": verification_result.exception_reason,
+            "merchant_blacklisted": verification_result.merchant_blacklisted,
+            "created_at": verify_record.created_at.isoformat() if verify_record.created_at else None
+        })
+        
+        verification_result_dict = verification_result.model_dump()
+    except Exception as e:
+        verification_result_dict = {"error": str(e)}
     
-    if invoice is None and duplicate_result is not None:
-        return {
-            "success": False,
-            "is_duplicate": True,
-            "is_new": False,
-            "message": "发票重复提交",
-            "error_code": "DUPLICATE_INVOICE",
-            "action_records": action_records,
-            "duplicate_info": {
-                "original_invoice_id": duplicate_result.original_invoice_id,
-                "submission_count": duplicate_result.submission_count,
-                "original_submission_date": duplicate_result.original_submission_date.isoformat() if duplicate_result.original_submission_date else None
-            }
-        }
+    db.refresh(invoice)
     
     invoice_dict = {
         "id": invoice.id,
@@ -207,6 +311,7 @@ async def upload_invoice(
         "success": True,
         "is_duplicate": False,
         "is_new": True,
+        "error_code": None,
         "message": "发票上传并查验成功",
         "invoice": invoice_dict,
         "verification_result": verification_result_dict,
@@ -329,31 +434,25 @@ async def check_duplicate(
         if original_invoice:
             if original_invoice.submitter_id != current_user.id and \
                current_user.role not in [UserRole.ADMIN, UserRole.FINANCE, UserRole.AUDITOR]:
-                return {
-                    "is_duplicate": True,
-                    "original_invoice_id": result.original_invoice_id,
-                    "original_submission_date": result.original_submission_date,
-                    "submission_count": result.submission_count,
-                    "is_owner": False,
-                    "message": "该发票已被他人提交"
-                }
-            else:
-                return {
-                    "is_duplicate": True,
-                    "original_invoice_id": result.original_invoice_id,
-                    "original_submission_date": result.original_submission_date,
-                    "submission_count": result.submission_count,
-                    "is_owner": original_invoice.submitter_id == current_user.id,
-                    "original_invoice": {
-                        "id": original_invoice.id,
-                        "invoice_code": original_invoice.invoice_code,
-                        "invoice_number": original_invoice.invoice_number,
-                        "seller_name": original_invoice.seller_name,
-                        "total_amount": original_invoice.total_amount,
-                        "verification_status": original_invoice.verification_status.value if original_invoice.verification_status else None,
-                        "created_at": original_invoice.created_at.isoformat() if original_invoice.created_at else None
-                    }
-                }
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="无权查询此发票的重复情况"
+                )
+            
+            return {
+                "is_duplicate": True,
+                "is_owner": original_invoice.submitter_id == current_user.id,
+                "original_invoice_id": result.original_invoice_id,
+                "original_invoice": {
+                    "id": original_invoice.id,
+                    "invoice_code": original_invoice.invoice_code,
+                    "invoice_number": original_invoice.invoice_number,
+                    "seller_name": original_invoice.seller_name,
+                    "total_amount": original_invoice.total_amount,
+                    "verification_status": original_invoice.verification_status.value if original_invoice.verification_status else None,
+                    "created_at": original_invoice.created_at.isoformat() if original_invoice.created_at else None
+                } if original_invoice.submitter_id == current_user.id or current_user.role in [UserRole.ADMIN, UserRole.FINANCE, UserRole.AUDITOR] else None
+            }
     
     return {
         "is_duplicate": False,
